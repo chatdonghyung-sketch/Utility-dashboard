@@ -19,16 +19,100 @@ from database import (
 )
 
 
+TREND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'HMI_Trend_data'))
+DIST_DIR  = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'dist'))
+WO_DIR    = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'Work_Order'))
+
+
+# ── Work Order 엑셀 파싱 헬퍼 ─────────────────────────────────────────
+_WO_COL_HEADERS = {
+    'wo_no':      'Wo No',
+    'work_type':  '작업 유형',
+    'work_name':  '작업명',
+    'equip_code': '설비코드',
+    'equip_name': '설비명',
+    'equip_type': '설비종류',
+    'location':   '위치 L4',
+    'start_date': '시작일',
+    'end_date':   '종료일',
+    'department': '작업부서',
+    'worker':     '작업자',
+    'writer':     '작성자',
+    'wo_status':  'WO 상태',
+}
+
+
+def _parse_work_order_excel(source) -> list[dict]:
+    """엑셀 파일(경로 str 또는 bytes)에서 작업지시서 records 파싱."""
+    try:
+        wb = openpyxl.load_workbook(source if isinstance(source, str) else io.BytesIO(source),
+                                    data_only=True)
+    except Exception as e:
+        print(f"[WO parse error] {e}")
+        return []
+    ws = wb.active
+
+    header_row, headers = None, []
+    for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        if row and any(str(c).strip() == 'Wo No' for c in row if c is not None):
+            header_row = i
+            headers = [str(c).strip() if c is not None else '' for c in row]
+            break
+    if header_row is None:
+        return []
+
+    col_map = {k: next((i for i, h in enumerate(headers) if h == v), None)
+               for k, v in _WO_COL_HEADERS.items()}
+
+    def _get(row, key):
+        idx = col_map.get(key)
+        if idx is None or idx >= len(row):
+            return ''
+        v = row[idx]
+        if v is None:
+            return ''
+        if hasattr(v, 'strftime'):
+            return v.strftime('%Y-%m-%d')
+        return str(v).strip()
+
+    records = []
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+        if not row or all(c is None for c in row):
+            continue
+        wo_no = _get(row, 'wo_no')
+        if not wo_no or wo_no == '예시값':
+            continue
+        records.append({k: _get(row, k) for k in col_map})
+    return records
+
+
+async def _scan_work_order_dir() -> dict:
+    """Work_Order/ 폴더 내 모든 xlsx 파일을 읽어 DB에 upsert."""
+    if not os.path.isdir(WO_DIR):
+        return {'scanned': 0, 'inserted': 0, 'updated': 0}
+    total_inserted = total_updated = scanned = 0
+    for fname in sorted(os.listdir(WO_DIR)):
+        if not fname.lower().endswith('.xlsx') or fname.startswith('~'):
+            continue
+        records = _parse_work_order_excel(os.path.join(WO_DIR, fname))
+        if records:
+            result = await upsert_work_orders(records)
+            total_inserted += result['inserted']
+            total_updated  += result['updated']
+            scanned += 1
+            print(f"[WO scan] {fname}: +{result['inserted']} inserted, ~{result['updated']} updated")
+    return {'scanned': scanned, 'inserted': total_inserted, 'updated': total_updated}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    result = await _scan_work_order_dir()
+    print(f"[Startup] Work Order scan: {result}")
     yield
 
 
 app = FastAPI(lifespan=lifespan)
-
-TREND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'HMI_Trend_data'))
-DIST_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'dist'))
 
 
 # ── 냉동기·냉각탑 운전일지 ────────────────────────────────────────────
@@ -265,61 +349,24 @@ async def trend_range(
 # ── Work Orders ──────────────────────────────────────────────────────
 @app.post('/api/work-orders/upload')
 async def upload_work_orders(file: UploadFile = File(...)):
+    """업로드된 엑셀 파일을 Work_Order/ 폴더에 저장 후 DB에 upsert."""
     content = await file.read()
-    wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-    ws = wb.active
+    os.makedirs(WO_DIR, exist_ok=True)
+    save_path = os.path.join(WO_DIR, file.filename or 'upload.xlsx')
+    with open(save_path, 'wb') as f:
+        f.write(content)
 
-    # Find header row (row with 'Wo No')
-    header_row = None
-    headers = []
-    for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
-        if row and any(str(c).strip() == 'Wo No' for c in row if c is not None):
-            header_row = i
-            headers = [str(c).strip() if c is not None else '' for c in row]
-            break
-
-    if header_row is None:
-        return JSONResponse({'error': 'Header row not found'}, status_code=400)
-
-    col_map = {
-        'wo_no':      next((i for i, h in enumerate(headers) if h == 'Wo No'), None),
-        'work_type':  next((i for i, h in enumerate(headers) if h == '작업 유형'), None),
-        'work_name':  next((i for i, h in enumerate(headers) if h == '작업명'), None),
-        'equip_code': next((i for i, h in enumerate(headers) if h == '설비코드'), None),
-        'equip_name': next((i for i, h in enumerate(headers) if h == '설비명'), None),
-        'equip_type': next((i for i, h in enumerate(headers) if h == '설비종류'), None),
-        'location':   next((i for i, h in enumerate(headers) if h == '위치 L4'), None),
-        'start_date': next((i for i, h in enumerate(headers) if h == '시작일'), None),
-        'end_date':   next((i for i, h in enumerate(headers) if h == '종료일'), None),
-        'department': next((i for i, h in enumerate(headers) if h == '작업부서'), None),
-        'worker':     next((i for i, h in enumerate(headers) if h == '작업자'), None),
-        'writer':     next((i for i, h in enumerate(headers) if h == '작성자'), None),
-        'wo_status':  next((i for i, h in enumerate(headers) if h == 'WO 상태'), None),
-    }
-
-    records = []
-    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
-        if not row or all(c is None for c in row):
-            continue
-        def get(key):
-            idx = col_map.get(key)
-            if idx is None or idx >= len(row):
-                return ''
-            v = row[idx]
-            if v is None:
-                return ''
-            if hasattr(v, 'strftime'):
-                return v.strftime('%Y-%m-%d')
-            return str(v).strip()
-        wo_no = get('wo_no')
-        if not wo_no or wo_no == '예시값':
-            continue
-        records.append({k: get(k) for k in col_map})
-
+    records = _parse_work_order_excel(save_path)
     if not records:
         return JSONResponse({'inserted': 0, 'updated': 0, 'message': '유효한 데이터 없음'})
-
     result = await upsert_work_orders(records)
+    return JSONResponse(result)
+
+
+@app.get('/api/work-orders/scan')
+async def rescan_work_orders():
+    """Work_Order/ 폴더 전체를 다시 스캔하여 DB를 갱신."""
+    result = await _scan_work_order_dir()
     return JSONResponse(result)
 
 
